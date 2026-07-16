@@ -178,12 +178,11 @@ class ReferenceAttentionControl:
                         modify_norm_hidden_states_v = torch.cat(
                             [norm_hidden_states] + bank_fea, dim=1
                         )
-                        # import ipdb;ipdb.set_trace()
+                        import ipdb;ipdb.set_trace()
                         hidden_states_uc = (
                         self.attn1(
                             norm_hidden_states
-                            # +Q'
-                         filter   +self.point_bank_main[0].repeat(norm_hidden_states.shape[0],1,1),
+                            +self.point_bank_main[0].repeat(norm_hidden_states.shape[0],1,1),
                             encoder_hidden_states=modify_norm_hidden_states,
                             encoder_hidden_states_v=modify_norm_hidden_states_v,
                             attention_mask=attention_mask,
@@ -274,7 +273,7 @@ class ReferenceAttentionControl:
                     # Feed-forward
                     hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
                     return hidden_states
-            # import ipdb;ipdb.set_trace()
+            import ipdb;ipdb.set_trace()
             if self.use_ada_layer_norm_zero:
                 attn_output = gate_msa.unsqueeze(1) * attn_output
             try:
@@ -357,7 +356,7 @@ class ReferenceAttentionControl:
                 reader_attn_modules = [
                     module
                     for module in (
-                        torch_dfs(self.unet.mid_block)F + torch_dfs(self.unet.up_blocks)
+                        torch_dfs(self.unet.mid_block) + torch_dfs(self.unet.up_blocks)
                     )
                     if isinstance(module, TemporalBasicTransformerBlock)
                 ]
@@ -387,7 +386,7 @@ class ReferenceAttentionControl:
             writer_attn_modules = sorted(
                 writer_attn_modules, key=lambda x: -x.norm1.normalized_shape[0]
             )
-            # import ipdb;ipdb.set_trace()
+            import ipdb;ipdb.set_trace()
             for r, w in zip(reader_attn_modules, writer_attn_modules):
                 r.bank = [v.clone().to(dtype) for v in w.bank]
                 
