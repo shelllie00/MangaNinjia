@@ -15,6 +15,9 @@ def torch_dfs(model: torch.nn.Module):
         result += torch_dfs(child)
     return result
 
+
+# Seems to do: shape the PointNet output into the shape of DenoisingNet
+# But how ??
 def filter_matrices_by_size(matrix_list, reference_matrix):
     ref_shape = reference_matrix.shape[-2:]
     return [matrix for matrix in matrix_list if matrix.shape[-2:] == ref_shape]
@@ -23,14 +26,16 @@ class ReferenceAttentionControl:
     def __init__(
         self,
         unet,
-        mode="write",
+        mode="write", # write -> refUnet, read -> denoisingUnet
         do_classifier_free_guidance=False,
         attention_auto_machine_weight=float("inf"),
         gn_auto_machine_weight=1.0,
         style_fidelity=1.0,
         reference_attn=True,
         reference_adain=False,
-        fusion_blocks="midup",
+        fusion_blocks="midup",  # Control whre the ref attn is inserted
+                                # midup → middle block and upsampling blocks
+                                # full  → all transformer blocks in the U-Net
         batch_size=1,
     ) -> None:
         # 10. Modify self attention and group norm
@@ -52,6 +57,8 @@ class ReferenceAttentionControl:
             batch_size=batch_size,
         )
         self.point_embedding=[]
+    
+    # 
     def register_reference_hooks(
         self,
         mode,
@@ -105,6 +112,7 @@ class ReferenceAttentionControl:
             video_length=None,
         ):
             if self.use_ada_layer_norm:  # False
+                # NORM1: change value but shpae still (Batch, 1024, 640channel)
                 norm_hidden_states = self.norm1(hidden_states, timestep)
             elif self.use_ada_layer_norm_zero:
                 (
@@ -137,9 +145,9 @@ class ReferenceAttentionControl:
                     **cross_attention_kwargs,
                 )
             else:
-                if MODE == "write":
-                    self.bank.append(norm_hidden_states.clone())
-                    attn_output = self.attn1(
+                if MODE == "write": # RefUNet
+                    self.bank.append(norm_hidden_states.clone()) # now we have Kref, Vref in bank
+                    attn_output = self.attn1( # RefNet do its own self-attention
                         norm_hidden_states,
                         encoder_hidden_states=encoder_hidden_states
                         if self.only_cross_attention
@@ -148,24 +156,34 @@ class ReferenceAttentionControl:
                         **cross_attention_kwargs,
                     )
                 if MODE == "read":
+                    # ???
                     bank_fea = [
                         rearrange(
                             d.unsqueeze(1).repeat(1, 1, 1, 1),
-                            "b t l c -> (b t) l c",
+                            "b t l c -> (b t) l c", # reshape but not used for MGNJ
                         )
                         for d in self.bank
                     ]
                     try:
+                        #  Add point embeddings and concatenate to construct Keys
+                        # dim = 1, indicates only concatenate dim 1
+                        # (Batch, 1024, Channels) + (Batch, 1024, Channels) = (Batch, 2048, Channels)
                         modify_norm_hidden_states = torch.cat(
-                            [norm_hidden_states+self.point_bank_main[0].repeat(norm_hidden_states.shape[0],1,1)] + [bank_fea[0]+self.point_bank_ref[0].repeat(norm_hidden_states.shape[0],1,1)], dim=1
+                            [norm_hidden_states
+                            +self.point_bank_main[0].repeat(norm_hidden_states.shape[0],1,1)]
+                            +[bank_fea[0]+self.point_bank_ref[0].repeat(norm_hidden_states.shape[0],1,1)],
+                            dim=1
                         )
+                        # Concatenate raw target and reference features to construct Values
                         modify_norm_hidden_states_v = torch.cat(
                             [norm_hidden_states] + bank_fea, dim=1
                         )
                         # import ipdb;ipdb.set_trace()
                         hidden_states_uc = (
                         self.attn1(
-                            norm_hidden_states+self.point_bank_main[0].repeat(norm_hidden_states.shape[0],1,1),
+                            norm_hidden_states
+                            # +Q'
+                         filter   +self.point_bank_main[0].repeat(norm_hidden_states.shape[0],1,1),
                             encoder_hidden_states=modify_norm_hidden_states,
                             encoder_hidden_states_v=modify_norm_hidden_states_v,
                             attention_mask=attention_mask,
@@ -184,6 +202,8 @@ class ReferenceAttentionControl:
                             )
                             + hidden_states
                         )
+
+                    # here for classifier free guidance 
                     if do_classifier_free_guidance:
                         hidden_states_c = hidden_states_uc.clone()
                         _uc_mask = uc_mask.clone()
@@ -206,6 +226,7 @@ class ReferenceAttentionControl:
                                 .to(device)
                                 .bool()
                             )
+                        # (1) no ref and point conditioning, target self-attention only
                         hidden_states_c[_uc_mask] = (
                             self.attn1(
                                 norm_hidden_states[_uc_mask],
@@ -214,6 +235,8 @@ class ReferenceAttentionControl:
                             )
                             + hidden_states[_uc_mask]
                         )
+                        # (2) ref conditioning, no point
+                        # Q = target, K,V = target+ref
                         modify_norm_hidden_states = torch.cat(
                             [norm_hidden_states] + bank_fea, dim=1
                         )
@@ -226,12 +249,14 @@ class ReferenceAttentionControl:
                             + hidden_states[_uc_mask_2]
                         )
                         hidden_states = hidden_states_c.clone()
+                    # (3) with ref and point conditioning
                     else:
                         hidden_states = hidden_states_uc
 
 
                     if self.attn2 is not None:
-                        # Cross-Attention
+                        # CLIP Cross-Attention
+                        # !!
                         norm_hidden_states = (
                             self.norm2(hidden_states, timestep)
                             if self.use_ada_layer_norm
@@ -240,7 +265,7 @@ class ReferenceAttentionControl:
                         hidden_states = (
                             self.attn2(
                                 norm_hidden_states,
-                                encoder_hidden_states=encoder_hidden_states,
+                                encoder_hidden_states=encoder_hidden_states, # K,v from refUnet?
                                 attention_mask=attention_mask,
                             )
                             + hidden_states
@@ -290,6 +315,9 @@ class ReferenceAttentionControl:
             return hidden_states
 
         if self.reference_attn:
+            # apply ref attention only to middle and upsampling blocks
+            # what is "the ref attention" here? CLIP or shuffle?
+            # 
             if self.fusion_blocks == "midup":
                 attn_modules = [
                     module
@@ -304,6 +332,9 @@ class ReferenceAttentionControl:
                     for module in torch_dfs(self.unet)
                     if isinstance(module, BasicTransformerBlock)
                 ]
+            
+            # sort attn modules from small to large
+            # why
             attn_modules = sorted(
                 attn_modules, key=lambda x: -x.norm1.normalized_shape[0]
             )
@@ -319,13 +350,14 @@ class ReferenceAttentionControl:
                 module.point_bank_main=[]
                 module.attn_weight = float(i) / float(len(attn_modules))
 
+    # copy ref features to denoising unet 
     def update(self, writer,point_embedding_ref=None,point_embedding_main=None,dtype=torch.float16):
         if self.reference_attn:
             if self.fusion_blocks == "midup":
                 reader_attn_modules = [
                     module
                     for module in (
-                        torch_dfs(self.unet.mid_block) + torch_dfs(self.unet.up_blocks)
+                        torch_dfs(self.unet.mid_block)F + torch_dfs(self.unet.up_blocks)
                     )
                     if isinstance(module, TemporalBasicTransformerBlock)
                 ]
@@ -337,6 +369,7 @@ class ReferenceAttentionControl:
                     )
                     if isinstance(module, BasicTransformerBlock)
                 ]
+            # when ?
             elif self.fusion_blocks == "full":
                 reader_attn_modules = [
                     module
@@ -357,6 +390,8 @@ class ReferenceAttentionControl:
             # import ipdb;ipdb.set_trace()
             for r, w in zip(reader_attn_modules, writer_attn_modules):
                 r.bank = [v.clone().to(dtype) for v in w.bank]
+                
+                # find the point embedding fit the level of Unet, then add it into 
                 if point_embedding_main is not None:
                     r.point_bank_ref=filter_matrices_by_size(point_embedding_ref, r.bank[0])
                     r.point_bank_main=filter_matrices_by_size(point_embedding_main, r.bank[0])
